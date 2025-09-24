@@ -1,12 +1,13 @@
 import logging
 import re
-import json
 import os
 from datetime import datetime
 from typing import Dict, List
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 import pandas as pd
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 # Configurazione logging
 logging.basicConfig(
@@ -17,24 +18,84 @@ logger = logging.getLogger(__name__)
 class SuperquoteBot:
     def __init__(self, token: str):
         self.token = token
-        self.data_file = 'superquote_data.json'
-        self.superquote_data = self.load_data()
+        self.mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+        self.db_name = os.getenv('DB_NAME', 'superquote_bot')
+        self.collection_name = 'superquotes'
+        self.client = None
+        self.db = None
+        self.collection = None
+        self._connect_to_mongo()
         
+    def _connect_to_mongo(self):
+        """Connessione a MongoDB con gestione errori"""
+        try:
+            self.client = MongoClient(self.mongo_uri)
+            # Test della connessione
+            self.client.admin.command('ping')
+            self.db = self.client[self.db_name]
+            self.collection = self.db[self.collection_name]
+            logger.info("✅ Connesso a MongoDB con successo!")
+            
+            # Crea indici per le query
+            self.collection.create_index([("data", -1)])
+            self.collection.create_index([("user_id", 1)])
+            self.collection.create_index([("esito", 1)])
+            
+        except ConnectionFailure as e:
+            logger.error(f"❌ Errore connessione MongoDB: {e}")
+            raise
+    
     def load_data(self) -> List[Dict]:
-        """Carica i dati dal file JSON"""
-        if os.path.exists(self.data_file):
-            try:
-                with open(self.data_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                return []
-        return []
+        """Carica tutti i dati da MongoDB"""
+        try:
+            cursor = self.collection.find({}).sort('data', -1)
+            data = list(cursor)
+            
+            # Converti ObjectId to string per compatibilità
+            for item in data:
+                item['_id'] = str(item['_id'])
+            
+            return data
+        except Exception as e:
+            logger.error(f"Errore nel caricamento dati: {e}")
+            return []
     
-    def save_data(self):
-        """Salva i dati nel file JSON"""
-        with open(self.data_file, 'w', encoding='utf-8') as f:
-            json.dump(self.superquote_data, f, ensure_ascii=False, indent=2)
+    def save_superquote(self, superquote: Dict) -> bool:
+        """Salva una superquote in MongoDB"""
+        try:
+            # Crea una copia per non modificare l'originale
+            sq_copy = superquote.copy()
+            # Rimuovi _id se presente per evitare duplicati
+            sq_copy.pop('_id', None)
+            
+            result = self.collection.insert_one(sq_copy)
+            logger.info(f"Superquote salvata con ID: {result.inserted_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Errore nel salvataggio: {e}")
+            return False
     
+    def get_all_superquotes(self) -> List[Dict]:
+        """Ottiene tutte le superquote ordinate per data (più recenti prima)"""
+        return self.load_data()
+    
+    def get_wins(self) -> List[Dict]:
+        """Ottiene solo le superquote vinte"""
+        try:
+            cursor = self.collection.find({"esito": "VINTA"}).sort('data', -1)
+            wins = list(cursor)
+            for item in wins:
+                item['_id'] = str(item['_id'])
+            return wins
+        except Exception as e:
+            logger.error(f"Errore nel recupero vincite: {e}")
+            return []
+    
+    def get_stats_data(self) -> pd.DataFrame:
+        """Ottiene i dati per le statistiche"""
+        data = self.load_data()
+        return pd.DataFrame(data) if data else pd.DataFrame()
+
     def parse_superquote(self, text: str) -> Dict or None:
         """
         Parsing del messaggio superquote
@@ -63,6 +124,8 @@ class SuperquoteBot:
                 esito = 'VINTA'
             elif esito in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
                 esito = 'PERSA'
+            else:
+                return None  # Esito non valido
             
             return {
                 'risultato': risultato,
@@ -89,19 +152,21 @@ class SuperquoteBot:
                     superquote['registrato_da'] = username
                     superquote['user_id'] = update.message.from_user.id
                     
-                    # Salva la superquote
-                    self.superquote_data.append(superquote)
-                    self.save_data()
+                    # Salva la superquote in MongoDB
+                    success = self.save_superquote(superquote)
                     
-                    # Conferma ricezione
-                    await update.message.reply_text(
-                        f"✅ Superquote registrata!\n"
-                        f"🎯 Risultato: {superquote['risultato']}\n"
-                        f"💰 Quota: {superquote['quota']}\n"
-                        f"💵 Vincita: €{superquote['vincita']:.2f}\n"
-                        f"📊 Esito: {superquote['esito']}\n"
-                        f"📅 Data: {superquote['data'][:16]}"
-                    )
+                    if success:
+                        # Conferma ricezione
+                        await update.message.reply_text(
+                            f"✅ Superquote registrata!\n"
+                            f"🎯 Risultato: {superquote['risultato']}\n"
+                            f"💰 Quota: {superquote['quota']}\n"
+                            f"💵 Vincita: €{superquote['vincita']:.2f}\n"
+                            f"📊 Esito: {superquote['esito']}\n"
+                            f"📅 Data: {superquote['data'][:16]}"
+                        )
+                    else:
+                        await update.message.reply_text("❌ Errore nel salvataggio dei dati!")
                 else:
                     await update.message.reply_text(
                         "❌ Formato non valido!\n\n"
@@ -114,12 +179,11 @@ class SuperquoteBot:
     
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Mostra le statistiche delle superquote"""
-        if not self.superquote_data:
+        df = self.get_stats_data()
+        
+        if df.empty:
             await update.message.reply_text("📊 Nessuna superquote registrata ancora!")
             return
-        
-        # Calcola statistiche
-        df = pd.DataFrame(self.superquote_data)
         
         stats_text = "📊 **STATISTICHE SUPERQUOTE CONDIVISE**\n\n"
         
@@ -167,64 +231,59 @@ class SuperquoteBot:
     
     async def show_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Mostra la lista delle superquote recenti"""
-        if not self.superquote_data:
+        superquotes = self.get_all_superquotes()
+        
+        if not superquotes:
             await update.message.reply_text("📝 Nessuna superquote registrata ancora!")
             return
-        
-        # Ordina per data (più recenti prima)
-        sorted_data = sorted(self.superquote_data, key=lambda x: x['data'], reverse=True)
         
         list_text = "📝 **ULTIME SUPERQUOTE**\n\n"
         
         # Mostra le ultime 12 per non superare il limite messaggi
-        for sq in sorted_data[:12]:
+        for sq in superquotes[:12]:
             icon = "✅" if sq['esito'] == 'VINTA' else "❌"
             data_breve = sq['data'][:10]  # Solo la data, senza ora
             
             list_text += f"{icon} **{sq['risultato']}**\n"
             list_text += f"    💰 {sq['quota']} → €{sq['vincita']:.2f} | {data_breve}\n\n"
         
-        if len(sorted_data) > 12:
-            list_text += f"📋 ... e altre {len(sorted_data) - 12} superquote\n"
+        if len(superquotes) > 12:
+            list_text += f"📋 ... e altre {len(superquotes) - 12} superquote\n"
             list_text += "Usa /export per il file completo"
         
         await update.message.reply_text(list_text, parse_mode='Markdown')
     
     async def show_recent_wins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Mostra solo le vincite recenti"""
-        if not self.superquote_data:
-            await update.message.reply_text("🎯 Nessuna superquote registrata ancora!")
-            return
+        wins = self.get_wins()
         
-        # Filtra solo le vincite e ordina per data
-        wins = [sq for sq in self.superquote_data if sq['esito'] == 'VINTA']
-        wins_sorted = sorted(wins, key=lambda x: x['data'], reverse=True)
-        
-        if not wins_sorted:
+        if not wins:
             await update.message.reply_text("🎯 Nessuna vincita registrata ancora!")
             return
         
         list_text = "🏆 **ULTIME VINCITE**\n\n"
         
-        for sq in wins_sorted[:10]:  # Ultime 10 vincite
+        for sq in wins[:10]:  # Ultime 10 vincite
             data_breve = sq['data'][:10]
             list_text += f"✅ **{sq['risultato']}**\n"
             list_text += f"    💰 {sq['quota']} → €{sq['vincita']:.2f} | {data_breve}\n\n"
         
-        if len(wins_sorted) > 10:
-            list_text += f"🎯 Totale vincite: {len(wins_sorted)}"
+        if len(wins) > 10:
+            list_text += f"🎯 Totale vincite: {len(wins)}"
         
         await update.message.reply_text(list_text, parse_mode='Markdown')
     
     async def export_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Esporta i dati in formato CSV"""
-        if not self.superquote_data:
+        superquotes = self.get_all_superquotes()
+        
+        if not superquotes:
             await update.message.reply_text("📊 Nessun dato da esportare!")
             return
         
         try:
             # Crea DataFrame e riordina le colonne
-            df = pd.DataFrame(self.superquote_data)
+            df = pd.DataFrame(superquotes)
             
             # Riordina le colonne per leggibilità
             column_order = ['data', 'risultato', 'quota', 'vincita', 'esito', 'registrato_da']
@@ -274,7 +333,7 @@ Scrivi: `SQ-risultato-quota-vincita-esito`
 VINTA, VINCITA, WIN → registra come vincita
 PERSA, PERDITA, LOSS → registra come perdita
 
-Il bot salva automaticamente tutto in un archivio condiviso! 🗂️
+Il bot salva automaticamente tutto in MongoDB! 🗂️
         """
         await update.message.reply_text(help_text, parse_mode='Markdown')
     
@@ -305,22 +364,29 @@ Il bot salva automaticamente tutto in un archivio condiviso! 🗂️
 if __name__ == '__main__':
     import os
     
-    # Leggi il token dalle variabili ambiente
+    # Leggi le variabili ambiente
     BOT_TOKEN = os.getenv('BOT_TOKEN')
+    MONGO_URI = os.getenv('MONGO_URI')
     
     if not BOT_TOKEN:
         print("❌ ERRORE: Variabile BOT_TOKEN non trovata!")
         print("\n📱 STEPS:")
         print("1. Crea il bot con @BotFather su Telegram")
         print("2. Copia il token")
-        print("3. Su Render, vai in Environment → Add BOT_TOKEN")
+        print("3. Su Railway, vai in Variables → Add BOT_TOKEN")
         exit(1)
     
-    # Verifica pandas
+    if not MONGO_URI:
+        print("⚠️  MONGO_URI non trovato, uso default locale")
+        print("💡 Su Railway, aggiungi MONGO_URI in Variables")
+    
+    # Verifica dipendenze
     try:
         import pandas as pd
-    except ImportError:
-        print("❌ ERRORE: pandas non installato")
+        from pymongo import MongoClient
+    except ImportError as e:
+        print(f"❌ ERRORE: Dipendenze mancanti - {e}")
+        print("📦 Installa con: pip install -r requirements.txt")
         exit(1)
     
     # Avvia il bot
