@@ -1,11 +1,12 @@
 import logging
 import re
 import os
+import csv
+import io
 from datetime import datetime
 from typing import Dict, List
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
-import pandas as pd
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
@@ -16,10 +17,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class SuperquoteBot:
-    def __init__(self, token: str):
+    def __init__(self, token: str, mongo_uri: str):
         self.token = token
-        self.mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
-        self.db_name = os.getenv('DB_NAME', 'superquote_bot')
+        self.mongo_uri = mongo_uri
+        self.db_name = 'superquote_bot'
         self.collection_name = 'superquotes'
         self.client = None
         self.db = None
@@ -29,9 +30,12 @@ class SuperquoteBot:
     def _connect_to_mongo(self):
         """Connessione a MongoDB con gestione errori"""
         try:
-            self.client = MongoClient(self.mongo_uri)
-            # Test della connessione
+            logger.info(f"🔗 Tentativo connessione a MongoDB: {self.mongo_uri[:20]}...")
+            self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
+            
+            # Test della connessione con timeout breve
             self.client.admin.command('ping')
+            
             self.db = self.client[self.db_name]
             self.collection = self.db[self.collection_name]
             logger.info("✅ Connesso a MongoDB con successo!")
@@ -41,12 +45,12 @@ class SuperquoteBot:
             self.collection.create_index([("user_id", 1)])
             self.collection.create_index([("esito", 1)])
             
-        except ConnectionFailure as e:
+        except Exception as e:
             logger.error(f"❌ Errore connessione MongoDB: {e}")
-            raise
+            raise ConnectionFailure(f"Impossibile connettersi a MongoDB: {e}")
     
-    def load_data(self) -> List[Dict]:
-        """Carica tutti i dati da MongoDB"""
+    def get_all_superquotes(self) -> List[Dict]:
+        """Ottiene tutte le superquote ordinate per data (più recenti prima)"""
         try:
             cursor = self.collection.find({}).sort('data', -1)
             data = list(cursor)
@@ -75,10 +79,6 @@ class SuperquoteBot:
             logger.error(f"Errore nel salvataggio: {e}")
             return False
     
-    def get_all_superquotes(self) -> List[Dict]:
-        """Ottiene tutte le superquote ordinate per data (più recenti prima)"""
-        return self.load_data()
-    
     def get_wins(self) -> List[Dict]:
         """Ottiene solo le superquote vinte"""
         try:
@@ -90,11 +90,6 @@ class SuperquoteBot:
         except Exception as e:
             logger.error(f"Errore nel recupero vincite: {e}")
             return []
-    
-    def get_stats_data(self) -> pd.DataFrame:
-        """Ottiene i dati per le statistiche"""
-        data = self.load_data()
-        return pd.DataFrame(data) if data else pd.DataFrame()
 
     def parse_superquote(self, text: str) -> Dict or None:
         """
@@ -179,18 +174,18 @@ class SuperquoteBot:
     
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Mostra le statistiche delle superquote"""
-        df = self.get_stats_data()
+        superquotes = self.get_all_superquotes()
         
-        if df.empty:
+        if not superquotes:
             await update.message.reply_text("📊 Nessuna superquote registrata ancora!")
             return
         
         stats_text = "📊 **STATISTICHE SUPERQUOTE CONDIVISE**\n\n"
         
         # Statistiche generali
-        total_superquote = len(df)
-        vinte = len(df[df['esito'] == 'VINTA'])
-        perse = len(df[df['esito'] == 'PERSA'])
+        total_superquote = len(superquotes)
+        vinte = len([sq for sq in superquotes if sq['esito'] == 'VINTA'])
+        perse = len([sq for sq in superquotes if sq['esito'] == 'PERSA'])
         
         stats_text += f"🎯 Totale superquote: {total_superquote}\n"
         stats_text += f"✅ Vinte: {vinte}\n"
@@ -201,9 +196,9 @@ class SuperquoteBot:
             stats_text += f"📈 % Successo: {percentuale_successo:.1f}%\n"
         
         # Statistiche economiche
-        vincita_totale = df['vincita'].sum()
-        vincita_media = df['vincita'].mean()
-        quota_media = df['quota'].mean()
+        vincita_totale = sum(sq['vincita'] for sq in superquotes)
+        vincita_media = vincita_totale / total_superquote if total_superquote > 0 else 0
+        quota_media = sum(sq['quota'] for sq in superquotes) / total_superquote if total_superquote > 0 else 0
         
         stats_text += f"\n💰 **DATI ECONOMICI:**\n"
         stats_text += f"💵 Vincita totale: €{vincita_totale:.2f}\n"
@@ -211,18 +206,18 @@ class SuperquoteBot:
         stats_text += f"🎲 Quota media: {quota_media:.2f}\n"
         
         # Migliori risultati
-        if len(df) > 0:
+        if superquotes:
             # Miglior vincita
-            best_win = df.loc[df['vincita'].idxmax()]
+            best_win = max(superquotes, key=lambda x: x['vincita'])
             stats_text += f"\n🏆 **MIGLIOR VINCITA:**\n"
             stats_text += f"🎯 {best_win['risultato']}\n"
             stats_text += f"💰 Quota {best_win['quota']} → €{best_win['vincita']:.2f}\n"
             stats_text += f"📅 {best_win['data'][:10]}\n"
             
             # Quota più alta vinta
-            won_bets = df[df['esito'] == 'VINTA']
-            if len(won_bets) > 0:
-                highest_won_odds = won_bets.loc[won_bets['quota'].idxmax()]
+            won_bets = [sq for sq in superquotes if sq['esito'] == 'VINTA']
+            if won_bets:
+                highest_won_odds = max(won_bets, key=lambda x: x['quota'])
                 stats_text += f"\n🎰 **QUOTA PIÙ ALTA VINTA:**\n"
                 stats_text += f"🎯 {highest_won_odds['risultato']}\n"
                 stats_text += f"💰 Quota {highest_won_odds['quota']}\n"
@@ -274,7 +269,7 @@ class SuperquoteBot:
         await update.message.reply_text(list_text, parse_mode='Markdown')
     
     async def export_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Esporta i dati in formato CSV"""
+        """Esporta i dati in formato CSV senza pandas"""
         superquotes = self.get_all_superquotes()
         
         if not superquotes:
@@ -282,27 +277,34 @@ class SuperquoteBot:
             return
         
         try:
-            # Crea DataFrame e riordina le colonne
-            df = pd.DataFrame(superquotes)
+            # Crea CSV in memoria
+            output = io.StringIO()
+            writer = csv.writer(output)
             
-            # Riordina le colonne per leggibilità
-            column_order = ['data', 'risultato', 'quota', 'vincita', 'esito', 'registrato_da']
-            df = df.reindex(columns=[col for col in column_order if col in df.columns])
+            # Intestazione
+            writer.writerow(['Data', 'Risultato', 'Quota', 'Vincita', 'Esito', 'Registrato da'])
             
-            # Nome file con timestamp
+            # Dati
+            for sq in superquotes:
+                writer.writerow([
+                    sq['data'],
+                    sq['risultato'],
+                    sq['quota'],
+                    sq['vincita'],
+                    sq['esito'],
+                    sq.get('registrato_da', 'N/A')
+                ])
+            
+            # Prepara il file per l'invio
+            csv_data = output.getvalue().encode('utf-8')
             csv_filename = f'superquote_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-            df.to_csv(csv_filename, index=False, encoding='utf-8')
             
             # Invia il file
-            with open(csv_filename, 'rb') as csv_file:
-                await update.message.reply_document(
-                    document=csv_file,
-                    filename=csv_filename,
-                    caption=f"📊 Export completo delle superquote\n🎯 {len(df)} record esportati"
-                )
-            
-            # Rimuovi il file temporaneo
-            os.remove(csv_filename)
+            await update.message.reply_document(
+                document=io.BytesIO(csv_data),
+                filename=csv_filename,
+                caption=f"📊 Export completo delle superquote\n🎯 {len(superquotes)} record esportati"
+            )
             
         except Exception as e:
             logger.error(f"Errore durante l'export: {e}")
@@ -370,25 +372,33 @@ if __name__ == '__main__':
     
     if not BOT_TOKEN:
         print("❌ ERRORE: Variabile BOT_TOKEN non trovata!")
-        print("\n📱 STEPS:")
-        print("1. Crea il bot con @BotFather su Telegram")
-        print("2. Copia il token")
-        print("3. Su Railway, vai in Variables → Add BOT_TOKEN")
+        print("💡 Aggiungi BOT_TOKEN in Railway Variables")
         exit(1)
     
     if not MONGO_URI:
-        print("⚠️  MONGO_URI non trovato, uso default locale")
-        print("💡 Su Railway, aggiungi MONGO_URI in Variables")
+        print("❌ ERRORE: MONGO_URL non trovata!")
+        print("💡 Assicurati che il servizio MongoDB sia collegato al progetto Railway")
+        exit(1)
+    
+    print(f"🔧 Configurazione:")
+    print(f"   BOT_TOKEN: {'***' + BOT_TOKEN[-4:] if BOT_TOKEN else 'MISSING'}")
+    print(f"   MONGO_URI: {MONGO_URI[:30]}...")
     
     # Verifica dipendenze
     try:
-        import pandas as pd
         from pymongo import MongoClient
     except ImportError as e:
         print(f"❌ ERRORE: Dipendenze mancanti - {e}")
-        print("📦 Installa con: pip install -r requirements.txt")
         exit(1)
     
     # Avvia il bot
-    bot = SuperquoteBot(BOT_TOKEN)
-    bot.run()
+    try:
+        bot = SuperquoteBot(BOT_TOKEN, MONGO_URI)
+        bot.run()
+    except ConnectionFailure as e:
+        print(f"❌ Impossibile avviare il bot: {e}")
+        print("💡 Verifica che:")
+        print("   1. Il servizio MongoDB sia avviato su Railway")
+        print("   2. La MONGO_URL sia corretta")
+        print("   3. Le credenziali MongoDB siano valide")
+        exit(1)
