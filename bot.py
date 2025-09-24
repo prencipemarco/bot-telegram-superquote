@@ -778,7 +778,7 @@ if __name__ == "__main__":
     
     # Leggi le variabili d'ambiente
     BOT_TOKEN = os.getenv('BOT_TOKEN')
-    MONGO_URI = os.getenv('MONGO_URI')
+    MONGO_URI = os.getenv('MONGO_URL')
     
     if not BOT_TOKEN or not MONGO_URI:
         print("❌ ERRORE: Imposta le variabili d'ambiente BOT_TOKEN e MONGO_URI")
