@@ -4,6 +4,8 @@ import os
 import csv
 import io
 import uuid
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from datetime import datetime
 from typing import Dict, List, Optional
 from telegram import Update
@@ -320,6 +322,115 @@ class SuperquoteBot:
             }
         return None
     
+    async def generate_profit_graph(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Genera e invia il grafico dell'andamento delle vincite"""
+        try:
+            superquotes = self.get_all_superquotes()
+            
+            if not superquotes:
+                await update.message.reply_text("📊 Nessuna superquote registrata ancora! Non posso generare il grafico.")
+                return
+            
+            # Ordina le superquote per data (dalla più vecchia alla più recente)
+            superquotes_sorted = sorted(superquotes, key=lambda x: x['data'])
+            
+            # Calcola l'andamento cumulativo del saldo
+            dates = []
+            cumulative_profit = []
+            current_balance = 0
+            
+            for sq in superquotes_sorted:
+                # Converti la stringa data in datetime
+                try:
+                    date_obj = datetime.strptime(sq['data'], '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    # Se il formato è diverso, prova un altro formato
+                    try:
+                        date_obj = datetime.strptime(sq['data'][:10], '%Y-%m-%d')
+                    except:
+                        date_obj = datetime.now()
+                
+                dates.append(date_obj)
+                
+                # Aggiorna il saldo corrente
+                if sq['esito'] == 'VINTA':
+                    current_balance += sq['vincita'] - sq['importo']  # Vincita netta
+                else:
+                    current_balance -= sq['importo']  # Perdita
+                
+                cumulative_profit.append(current_balance)
+            
+            # Crea il grafico
+            plt.figure(figsize=(10, 6))
+            
+            # Colore del grafico in base al saldo finale
+            line_color = 'green' if current_balance >= 0 else 'red'
+            fill_color = 'lightgreen' if current_balance >= 0 else 'lightcoral'
+            
+            # Traccia l'andamento
+            plt.plot(dates, cumulative_profit, color=line_color, linewidth=2.5, label='Saldo')
+            plt.fill_between(dates, cumulative_profit, alpha=0.3, color=fill_color)
+            
+            # Linea dello zero
+            plt.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
+            
+            # Formatta le date
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+            plt.gca().xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+            plt.gcf().autofmt_xdate()
+            
+            # Titoli e labels
+            plt.title('📈 Andamento delle Vincite Cumulative', fontsize=14, fontweight='bold')
+            plt.xlabel('Data')
+            plt.ylabel('Saldo (€)')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            
+            # Aggiungi annotazione con il saldo finale
+            final_balance_text = f"Saldo finale: €{current_balance:.2f}"
+            plt.annotate(final_balance_text, 
+                        xy=(1, 0), xycoords='axes fraction',
+                        xytext=(-10, 10), textcoords='offset points',
+                        ha='right', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
+                        fontsize=10)
+            
+            # Salva il grafico in memoria
+            graph_buffer = io.BytesIO()
+            plt.savefig(graph_buffer, format='png', dpi=100, bbox_inches='tight')
+            graph_buffer.seek(0)
+            plt.close()
+            
+            # Prepara il messaggio con le statistiche
+            balance_data = self.calculate_balance()
+            saldo = balance_data['saldo']
+            saldo_text = "POSITIVO 🟢" if saldo >= 0 else "NEGATIVO 🔴"
+            
+            caption = (
+                f"📊 **GRAFICO ANDAMENTO VINCITE**\n\n"
+                f"💰 **Saldo attuale:** €{saldo:.2f} ({saldo_text})\n"
+                f"🎯 Giocate totali: {balance_data['total_bets']}\n"
+                f"✅ Vincite: {balance_data['wins']} | ❌ Perdite: {balance_data['losses']}\n"
+                f"📈 % Successo: {(balance_data['wins']/balance_data['total_bets']*100):.1f}%\n\n"
+                f"🔄 Il grafico mostra l'andamento giocata per giocata"
+            )
+            
+            # Invia il grafico
+            await update.message.reply_photo(
+                photo=graph_buffer,
+                caption=caption,
+                parse_mode='Markdown'
+            )
+            
+            logger.info(f"📈 Grafico inviato per {len(superquotes)} giocate")
+            
+        except Exception as e:
+            logger.error(f"Errore nella generazione del grafico: {e}")
+            await update.message.reply_text(
+                "❌ Errore nella generazione del grafico. Riprova più tardi.\n"
+                f"Errore: {str(e)}"
+            )
+    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Gestisce i messaggi in arrivo"""
         if update.message and update.message.text:
@@ -618,6 +729,7 @@ Scrivi: `MODIFICA-ID-ESITO`
 /lista - Ultime superquote con ID
 /vincite - Solo le vincite recenti  
 /saldo - Mostra solo il saldo attuale
+/graph - Grafico andamento vincite
 /export - Esporta tutto in CSV
 /help - Questo messaggio
 
@@ -645,59 +757,46 @@ Il bot salva automaticamente tutto in MongoDB! 🗂️
             application.add_handler(CommandHandler("lista", self.show_list))
             application.add_handler(CommandHandler("vincite", self.show_recent_wins))
             application.add_handler(CommandHandler("saldo", self.show_balance))
+            application.add_handler(CommandHandler("graph", self.generate_profit_graph))
             application.add_handler(CommandHandler("export", self.export_csv))
             application.add_handler(CommandHandler("help", self.help_command))
             application.add_handler(CommandHandler("start", self.help_command))
             
             logger.info("🤖 Bot Superquote Enhanced avviato con successo!")
             print("🤖 Bot Superquote Enhanced avviato! Premi Ctrl+C per fermare.")
-            application.run_polling()
+            print("📊 Comandi disponibili: /stats, /lista, /vincite, /saldo, /graph, /export, /help")
+            
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
             
         except Exception as e:
             logger.error(f"Errore nell'avvio del bot: {e}")
-            print(f"❌ Errore: {e}")
+            raise
 
-if __name__ == '__main__':
+# Configurazione e avvio
+if __name__ == "__main__":
+    import os
+    
+    # Leggi le variabili d'ambiente
     BOT_TOKEN = os.getenv('BOT_TOKEN')
-    MONGO_URI = os.getenv('MONGO_URL')
+    MONGO_URI = os.getenv('MONGO_URI')
     
-    if not BOT_TOKEN:
-        print("❌ ERRORE: Variabile BOT_TOKEN non trovata!")
-        print("💡 Aggiungi BOT_TOKEN in Railway Variables")
-        exit(1)
-    
-    if not MONGO_URI:
-        print("❌ ERRORE: MONGO_URL non trovata!")
-        print("💡 Configura MONGO_URL nelle variabili di Railway")
-        exit(1)
-    
-    print(f"🔧 Configurazione:")
-    print(f"   BOT_TOKEN: {'***' + BOT_TOKEN[-4:] if BOT_TOKEN else 'MISSING'}")
-    print(f"   MONGO_URI: {MONGO_URI[:30]}...")
-    
-    try:
-        from pymongo import MongoClient
-    except ImportError as e:
-        print(f"❌ ERRORE: Dipendenze mancanti - {e}")
+    if not BOT_TOKEN or not MONGO_URI:
+        print("❌ ERRORE: Imposta le variabili d'ambiente BOT_TOKEN e MONGO_URI")
+        print("💡 Su Railway: vai in Variables tab e aggiungi:")
+        print("   BOT_TOKEN=il_tuo_token_di_telegram")
+        print("   MONGO_URI=la_tua_stringa_di_connessione_mongodb")
         exit(1)
     
     try:
         bot = SuperquoteBot(BOT_TOKEN, MONGO_URI)
         bot.run()
     except ConnectionFailure as e:
-        print(f"❌ Impossibile avviare il bot: {e}")
-        if "OutOfDiskSpace" in str(e) or "spazio disco" in str(e):
-            print("\n🔧 SOLUZIONI POSSIBILI:")
-            print("   1. 📈 Upgrade del piano Railway (raccomandato)")
-            print("   2. 🌐 Usa MongoDB Atlas gratuito:")
-            print("      - Vai su https://cloud.mongodb.com")
-            print("      - Crea un cluster gratuito (512MB)")
-            print("      - Copia la connection string")
-            print("      - Aggiornala in Railway Variables")
-            print("   3. 🗑️ Pulisci il database attuale")
-        else:
-            print("💡 Verifica che:")
-            print("   1. Il servizio MongoDB sia avviato su Railway")
-            print("   2. La MONGO_URL sia corretta")
-            print("   3. Le credenziali MongoDB siano valide")
+        print(f"❌ ERRORE CONNESSIONE MONGODB: {e}")
+        print("💡 Soluzioni:")
+        print("1. Verifica che MongoDB sia attivo su Railway")
+        print("2. Controlla la stringa di connessione MONGO_URI")
+        print("3. Se hai esaurito lo spazio, usa MongoDB Atlas gratuito")
+        exit(1)
+    except Exception as e:
+        print(f"❌ ERRORE IMPREVISTO: {e}")
         exit(1)
