@@ -1010,8 +1010,8 @@ def main():
     """Funzione principale per avviare il bot"""
     
     # Configurazione
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
-    MONGODB_URI = os.getenv('MONGODB_URI')
+    TOKEN = os.getenv('BOT_TOKEN')
+    MONGODB_URI = os.getenv('MONGO_URL')
     
     if not TOKEN:
         logger.error("❌ TELEGRAM_TOKEN non trovato nelle variabili d'ambiente!")
