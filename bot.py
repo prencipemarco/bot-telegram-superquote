@@ -192,39 +192,59 @@ class SuperquoteBot:
             logger.error(f"Errore nel salvataggio: {e}")
             return False
     
-    def update_superquote_outcome(self, quote_id: str, new_outcome: str) -> bool:
-        """Aggiorna l'esito di una superquote esistente"""
+    def update_superquote(self, quote_id: str, updates: Dict) -> bool:
+        """Aggiorna una superquote esistente con nuovi dati"""
         try:
-            # Trova la superquote
+            # Trova la superquote esistente
             existing = self.find_superquote_by_id(quote_id)
             if not existing:
                 return False
             
-            # Normalizza il nuovo esito
-            if new_outcome.upper() in ['VINTA', 'VINCITA', 'WIN', 'W']:
-                new_outcome = 'VINTA'
-            elif new_outcome.upper() in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
-                new_outcome = 'PERSA'
-            else:
-                return False
+            # Prepara i campi da aggiornare
+            update_fields = {}
             
-            # Calcola la nuova vincita
-            new_vincita = self.calculate_winning_amount(
-                existing['quota'], 
-                existing['importo'], 
-                new_outcome
-            )
+            # Gestisci l'aggiornamento del risultato
+            if 'risultato' in updates:
+                update_fields['risultato'] = updates['risultato']
             
-            # Aggiorna nel database
+            # Gestisci l'aggiornamento della quota
+            if 'quota' in updates:
+                new_quota = float(updates['quota'])
+                update_fields['quota'] = new_quota
+            
+            # Gestisci l'aggiornamento dell'importo
+            if 'importo' in updates:
+                new_importo = float(updates['importo'])
+                update_fields['importo'] = new_importo
+            
+            # Gestisci l'aggiornamento dell'esito
+            if 'esito' in updates:
+                new_esito = updates['esito'].upper()
+                if new_esito in ['VINTA', 'VINCITA', 'WIN', 'W']:
+                    new_esito = 'VINTA'
+                elif new_esito in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
+                    new_esito = 'PERSA'
+                else:
+                    return False
+                update_fields['esito'] = new_esito
+            
+            # Calcola la nuova vincita se sono cambiati quota, importo o esito
+            if any(field in updates for field in ['quota', 'importo', 'esito']):
+                final_quota = update_fields.get('quota', existing['quota'])
+                final_importo = update_fields.get('importo', existing['importo'])
+                final_esito = update_fields.get('esito', existing['esito'])
+                
+                update_fields['vincita'] = self.calculate_winning_amount(
+                    final_quota, final_importo, final_esito
+                )
+            
+            # Aggiungi data di modifica
+            update_fields['data_modifica'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Esegui l'aggiornamento nel database
             result = self.collection.update_one(
                 {"quote_id": quote_id.upper()},
-                {
-                    "$set": {
-                        "esito": new_outcome,
-                        "vincita": new_vincita,
-                        "data_modifica": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                }
+                {"$set": update_fields}
             )
             
             return result.modified_count > 0
@@ -233,80 +253,23 @@ class SuperquoteBot:
             logger.error(f"Errore nell'aggiornamento: {e}")
             return False
     
-    def get_wins(self) -> List[Dict]:
-        """Ottiene solo le superquote vinte"""
-        try:
-            cursor = self.collection.find({"esito": "VINTA"}).sort('data', -1).limit(100)
-            wins = list(cursor)
-            for item in wins:
-                item['_id'] = str(item['_id'])
-            return wins
-        except Exception as e:
-            logger.error(f"Errore nel recupero vincite: {e}")
-            return []
-
-    def parse_superquote(self, text: str) -> Optional[Dict]:
-        """
-        Parsing del messaggio superquote
-        Formato aggiornato: SQ-risultato-quota-importo-esito
-        Esempio: SQ-1MILAN-2.00-10.00-VINTA
-        """
-        text_clean = text.strip()
-        
-        # Pattern regex più flessibile
-        pattern = r'^SQ-([^-]+)-([0-9]+(?:\.[0-9]+)?)-([0-9]+(?:\.[0-9]+)?)-([^-]+)$'
-        match = re.match(pattern, text_clean, re.IGNORECASE)
-        
-        if match:
-            risultato = match.group(1).strip()
-            try:
-                quota = float(match.group(2))
-                importo = float(match.group(3))  # Ora è l'importo giocato
-            except ValueError:
-                return None
-            
-            esito = match.group(4).strip().upper()
-            
-            # Normalizza l'esito
-            if esito in ['VINTA', 'VINCITA', 'WIN', 'W']:
-                esito = 'VINTA'
-            elif esito in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
-                esito = 'PERSA'
-            else:
-                return None
-            
-            # Calcola la vincita
-            vincita = self.calculate_winning_amount(quota, importo, esito)
-            
-            # Genera ID univoco
-            quote_id = self.generate_quote_id()
-            
-            return {
-                'quote_id': quote_id,
-                'risultato': risultato,
-                'quota': quota,
-                'importo': importo,
-                'vincita': vincita,
-                'esito': esito,
-                'data': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'messaggio_originale': text_clean
-            }
-        return None
-    
     def parse_modify_command(self, text: str) -> Optional[Dict]:
         """
-        Parsing del comando di modifica
-        Formato: MODIFICA-ID-ESITO
-        Esempio: MODIFICA-A1B2C3D4-VINTA
+        Parsing del comando di modifica avanzato
+        Formati supportati:
+        - MODIFICA-ID-ESITO (compatibilità)
+        - MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO (nuovo)
+        - MODIFICA-ID-CAMPO=VALORE (modifica singolo campo)
         """
-        text_clean = text.strip()
+        text_clean = text.strip().upper()
         
-        pattern = r'^MODIFICA-([A-Z0-9]{8})-([^-]+)$'
-        match = re.match(pattern, text_clean, re.IGNORECASE)
+        # Formato semplice: MODIFICA-ID-ESITO (compatibilità)
+        simple_pattern = r'^MODIFICA-([A-Z0-9]{8})-([^-]+)$'
+        simple_match = re.match(simple_pattern, text_clean)
         
-        if match:
-            quote_id = match.group(1).upper()
-            esito = match.group(2).strip().upper()
+        if simple_match:
+            quote_id = simple_match.group(1)
+            esito = simple_match.group(2)
             
             # Normalizza l'esito
             if esito in ['VINTA', 'VINCITA', 'WIN', 'W']:
@@ -318,23 +281,72 @@ class SuperquoteBot:
             
             return {
                 'quote_id': quote_id,
-                'nuovo_esito': esito
+                'updates': {'esito': esito},
+                'tipo': 'semplice'
             }
+        
+        # Formato completo: MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO
+        full_pattern = r'^MODIFICA-([A-Z0-9]{8})-([^-]+)-([0-9.]+)-([0-9.]+)-([^-]+)$'
+        full_match = re.match(full_pattern, text_clean)
+        
+        if full_match:
+            quote_id = full_match.group(1)
+            risultato = full_match.group(2)
+            quota = full_match.group(3)
+            importo = full_match.group(4)
+            esito = full_match.group(5)
+            
+            # Normalizza l'esito
+            if esito in ['VINTA', 'VINCITA', 'WIN', 'W']:
+                esito = 'VINTA'
+            elif esito in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
+                esito = 'PERSA'
+            else:
+                return None
+            
+            return {
+                'quote_id': quote_id,
+                'updates': {
+                    'risultato': risultato,
+                    'quota': quota,
+                    'importo': importo,
+                    'esito': esito
+                },
+                'tipo': 'completo'
+            }
+        
+        # Formato campo singolo: MODIFICA-ID-CAMPO=VALORE
+        field_pattern = r'^MODIFICA-([A-Z0-9]{8})-(RISULTATO|QUOTA|IMPORTO|ESITO)=(.+)$'
+        field_match = re.match(field_pattern, text_clean)
+        
+        if field_match:
+            quote_id = field_match.group(1)
+            campo = field_match.group(2).lower()
+            valore = field_match.group(3)
+            
+            updates = {campo: valore}
+            
+            return {
+                'quote_id': quote_id,
+                'updates': updates,
+                'tipo': 'campo_singolo'
+            }
+        
         return None
     
     def delete_superquote(self, quote_id: str) -> bool:
-    """Elimina una superquote tramite il suo ID"""
-    try:
-        result = self.collection.delete_one({"quote_id": quote_id.upper()})
-        if result.deleted_count > 0:
-            logger.info(f"Superquote {quote_id} eliminata con successo")
-            return True
-        else:
-            logger.warning(f"Nessuna superquote trovata con ID {quote_id}")
+        """Elimina una superquote tramite il suo ID"""
+        try:
+            result = self.collection.delete_one({"quote_id": quote_id.upper()})
+            if result.deleted_count > 0:
+                logger.info(f"Superquote {quote_id} eliminata con successo")
+                return True
+            else:
+                logger.warning(f"Nessuna superquote trovata con ID {quote_id}")
+                return False
+        except Exception as e:
+            logger.error(f"Errore nell'eliminazione: {e}")
             return False
-    except Exception as e:
-        logger.error(f"Errore nell'eliminazione: {e}")
-        return False
 
     def parse_delete_command(self, text: str) -> Optional[str]:
         """
@@ -351,6 +363,62 @@ class SuperquoteBot:
             quote_id = match.group(1).upper()
             return quote_id
         return None
+    
+    def get_user_stats(self, user_id: int = None) -> Dict:
+        """Calcola le statistiche per un utente specifico"""
+        try:
+            query = {}
+            if user_id:
+                query = {"user_id": user_id}
+            
+            superquotes = list(self.collection.find(query))
+            
+            if not superquotes:
+                return {
+                    'total_bets': 0,
+                    'wins': 0,
+                    'losses': 0,
+                    'total_bet': 0.0,
+                    'total_winnings': 0.0,
+                    'saldo': 0.0
+                }
+            
+            total_bet = sum(sq['importo'] for sq in superquotes)
+            total_winnings = sum(sq['vincita'] for sq in superquotes if sq['esito'] == 'VINTA')
+            wins = len([sq for sq in superquotes if sq['esito'] == 'VINTA'])
+            losses = len([sq for sq in superquotes if sq['esito'] == 'PERSA'])
+            balance = total_winnings - total_bet
+            
+            return {
+                'total_bets': len(superquotes),
+                'wins': wins,
+                'losses': losses,
+                'total_bet': total_bet,
+                'total_winnings': total_winnings,
+                'saldo': balance
+            }
+        except Exception as e:
+            logger.error(f"Errore calcolo statistiche utente: {e}")
+            return {
+                'total_bets': 0,
+                'wins': 0,
+                'losses': 0,
+                'total_bet': 0.0,
+                'total_winnings': 0.0,
+                'saldo': 0.0
+            }
+    
+    def get_recent_activity(self, limit: int = 10) -> List[Dict]:
+        """Ottiene le attività recenti con limit personalizzato"""
+        try:
+            cursor = self.collection.find({}).sort('data', -1).limit(limit)
+            data = list(cursor)
+            for item in data:
+                item['_id'] = str(item['_id'])
+            return data
+        except Exception as e:
+            logger.error(f"Errore nel caricamento attività recenti: {e}")
+            return []
     
     async def generate_profit_graph(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Genera e invia il grafico dell'andamento delle vincite"""
@@ -482,36 +550,105 @@ class SuperquoteBot:
                         )
                         return
                     
-                    # Aggiorna l'esito
-                    success = self.update_superquote_outcome(
+                    # Aggiorna la superquote
+                    success = self.update_superquote(
                         modify_data['quote_id'], 
-                        modify_data['nuovo_esito']
+                        modify_data['updates']
                     )
                     
                     if success:
                         # Ricarica i dati aggiornati
                         updated = self.find_superquote_by_id(modify_data['quote_id'])
                         
-                        await update.message.reply_text(
-                            f"✅ Giocata modificata!\n\n"
+                        response_text = (
+                            f"✅ Giocata modificata con successo!\n\n"
                             f"🆔 ID: {updated['quote_id']}\n"
                             f"🎯 Risultato: {updated['risultato']}\n"
                             f"💰 Quota: {updated['quota']}\n"
                             f"💵 Importo: €{updated['importo']:.2f}\n"
                             f"🏆 Vincita: €{updated['vincita']:.2f}\n"
                             f"📊 Esito: {updated['esito']}\n"
-                            f"📅 Modificata: {updated.get('data_modifica', 'N/A')}"
+                            f"📅 Ultima modifica: {updated.get('data_modifica', 'N/A')}\n\n"
                         )
+                        
+                        if modify_data['tipo'] == 'semplice':
+                            response_text += "💡 Modifica completata (solo esito)"
+                        elif modify_data['tipo'] == 'completo':
+                            response_text += "💡 Modifica completa di tutti i campi"
+                        elif modify_data['tipo'] == 'campo_singolo':
+                            campo_modificato = list(modify_data['updates'].keys())[0]
+                            response_text += f"💡 Modificato solo il campo: {campo_modificato.upper()}"
+                        
+                        await update.message.reply_text(response_text)
                     else:
                         await update.message.reply_text("❌ Errore durante la modifica!")
                 else:
                     await update.message.reply_text(
                         "❌ Formato modifica non valido!\n\n"
-                        "📝 Usa il formato: MODIFICA-ID-ESITO\n\n"
-                        "🎯 Esempi:\n"
-                        "• MODIFICA-A1B2C3D4-VINTA\n"
-                        "• MODIFICA-E5F6G7H8-PERSA"
+                        "📝 **Formati supportati:**\n\n"
+                        "• `MODIFICA-ID-ESITO` (solo esito)\n"
+                        "   Es: MODIFICA-A1B2C3D4-VINTA\n\n"
+                        "• `MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO` (tutto)\n"
+                        "   Es: MODIFICA-A1B2C3D4-1MILAN-2.50-15.00-VINTA\n\n"
+                        "• `MODIFICA-ID-CAMPO=VALORE` (campo specifico)\n"
+                        "   Es: MODIFICA-A1B2C3D4-QUOTA=2.50\n"
+                        "   Es: MODIFICA-A1B2C3D4-IMPORTO=20.00\n"
+                        "   Es: MODIFICA-A1B2C3D4-RISULTATO=OVER2.5\n\n"
+                        "🔍 Usa /lista per vedere gli ID disponibili"
                     )
+            
+            # Gestione comando ELIMINA
+            elif message_text.upper().startswith(('ELIMINA', 'DELETE')):
+                quote_id = self.parse_delete_command(message_text)
+                
+                if quote_id:
+                    existing = self.find_superquote_by_id(quote_id)
+                    
+                    if not existing:
+                        await update.message.reply_text(f"❌ ID {quote_id} non trovato!")
+                        return
+                    
+                    # Mostra conferma prima di eliminare
+                    confirm_text = (
+                        f"⚠️ **CONFERMA ELIMINAZIONE**\n\n"
+                        f"🆔 ID: {existing['quote_id']}\n"
+                        f"🎯 {existing['risultato']}\n"
+                        f"💰 €{existing['importo']:.2f} x {existing['quota']}\n"
+                        f"📊 Esito: {existing['esito']}\n\n"
+                        f"❓ Sei sicuro di voler ELIMINARE questa giocata?\n"
+                        f"Scrivi: **CONFERMA {quote_id}** per eliminare"
+                    )
+                    
+                    # Salva l'ID per la conferma nel context
+                    if 'pending_deletions' not in context.chat_data:
+                        context.chat_data['pending_deletions'] = {}
+                    context.chat_data['pending_deletions'][quote_id] = existing
+                    
+                    await update.message.reply_text(confirm_text, parse_mode='Markdown')
+                else:
+                    await update.message.reply_text(
+                        "❌ Formato eliminazione non valido!\n\n"
+                        "📝 Usa: ELIMINA-ID\n"
+                        "Esempio: ELIMINA-A1B2C3D4\n\n"
+                        "🔍 Usa /lista per vedere gli ID"
+                    )
+            
+            # Gestione conferma eliminazione
+            elif message_text.upper().startswith('CONFERMA'):
+                parts = message_text.upper().split()
+                if len(parts) == 2 and 'pending_deletions' in context.chat_data:
+                    quote_id = parts[1]
+                    if quote_id in context.chat_data['pending_deletions']:
+                        success = self.delete_superquote(quote_id)
+                        if success:
+                            await update.message.reply_text(f"✅ Giocata {quote_id} eliminata con successo!")
+                            del context.chat_data['pending_deletions'][quote_id]
+                        else:
+                            await update.message.reply_text("❌ Errore durante l'eliminazione!")
+                    else:
+                        await update.message.reply_text("❌ ID non valido o conferma scaduta!")
+                else:
+                    await update.message.reply_text("❌ Formato conferma non valido!")
             
             # Gestione inserimento superquote
             elif message_text.upper().startswith('SQ'):
@@ -533,7 +670,10 @@ class SuperquoteBot:
                             f"🏆 Vincita: €{superquote['vincita']:.2f}\n"
                             f"📊 Esito: {superquote['esito']}\n"
                             f"📅 Data: {superquote['data'][:16]}\n\n"
-                            f"💡 Per modificare usa: MODIFICA-{superquote['quote_id']}-ESITO"
+                            f"💡 Per modificare usa uno di questi formati:\n"
+                            f"• MODIFICA-{superquote['quote_id']}-ESITO\n"
+                            f"• MODIFICA-{superquote['quote_id']}-RISULTATO-QUOTA-IMPORTO-ESITO\n"
+                            f"• MODIFICA-{superquote['quote_id']}-CAMPO=VALORE"
                         )
                     else:
                         await update.message.reply_text(
@@ -617,26 +757,43 @@ class SuperquoteBot:
     async def show_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Mostra la lista delle superquote recenti con ID"""
         try:
-            superquotes = self.get_all_superquotes()
+            # Controlla se è stato passato un limite
+            limit = 15
+            if context.args and context.args[0].isdigit():
+                limit = min(int(context.args[0]), 50)  # Massimo 50 elementi
+            
+            superquotes = self.get_recent_activity(limit)
             
             if not superquotes:
                 await update.message.reply_text("📝 Nessuna superquote registrata ancora!")
                 return
             
-            list_text = "📝 **ULTIME SUPERQUOTE**\n\n"
+            list_text = f"📝 **ULTIME {len(superquotes)} SUPERQUOTE**\n\n"
             
-            for sq in superquotes[:15]:
-                icon = "✅" if sq['esito'] == 'VINTA' else "❌"
-                data_breve = sq['data'][:10]
+            for i, sq in enumerate(superquotes, 1):
+                emoji = "✅" if sq['esito'] == 'VINTA' else "❌"
+                list_text += f"{emoji} **{sq['quote_id']}** - {sq['data'][:10]}\n"
+                list_text += f"🎯 {sq['risultato']}\n"
+                list_text += f"💰 €{sq['importo']:.2f} x {sq['quota']} → €{sq['vincita']:.2f}\n"
                 
-                list_text += f"{icon} **{sq['risultato']}** (ID: `{sq['quote_id']}`)\n"
-                list_text += f"    💰 €{sq['importo']:.2f} x {sq['quota']} → €{sq['vincita']:.2f} | {data_breve}\n\n"
+                if sq.get('registrato_da'):
+                    list_text += f"👤 {sq['registrato_da']}\n"
+                
+                if sq.get('data_modifica'):
+                    list_text += f"🔄 Modificata: {sq['data_modifica'][:16]}\n"
+                
+                list_text += "\n"
             
-            if len(superquotes) > 15:
-                list_text += f"📋 ... e altre {len(superquotes) - 15} superquote\n"
-                list_text += "Usa /export per il file completo\n\n"
-            
-            list_text += "💡 Per modificare: MODIFICA-ID-ESITO"
+            # Aggiungi istruzioni per la modifica
+            list_text += (
+                "🔧 **COME MODIFICARE:**\n"
+                "• `MODIFICA-ID-ESITO` (solo esito)\n"
+                "• `MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO` (tutto)\n"
+                "• `MODIFICA-ID-CAMPO=VALORE` (campo specifico)\n\n"
+                "🗑️ **COME ELIMINARE:**\n"
+                "• `ELIMINA-ID`\n"
+                "• `DELETE-ID`"
+            )
             
             await update.message.reply_text(list_text, parse_mode='Markdown')
             
@@ -644,189 +801,262 @@ class SuperquoteBot:
             logger.error(f"Errore show_list: {e}")
             await update.message.reply_text("❌ Errore nel caricamento lista. Riprova più tardi.")
     
-    async def show_recent_wins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mostra solo le vincite recenti"""
-        try:
-            wins = self.get_wins()
-            
-            if not wins:
-                await update.message.reply_text("🎯 Nessuna vincita registrata ancora!")
-                return
-            
-            list_text = "🏆 **ULTIME VINCITE**\n\n"
-            
-            for sq in wins[:12]:
-                data_breve = sq['data'][:10]
-                list_text += f"✅ **{sq['risultato']}** (ID: `{sq['quote_id']}`)\n"
-                list_text += f"    💰 €{sq['importo']:.2f} x {sq['quota']} → €{sq['vincita']:.2f} | {data_breve}\n\n"
-            
-            if len(wins) > 12:
-                list_text += f"🎯 Totale vincite: {len(wins)}"
-            
-            await update.message.reply_text(list_text, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Errore show_recent_wins: {e}")
-            await update.message.reply_text("❌ Errore nel caricamento vincite. Riprova più tardi.")
-    
-    async def show_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mostra solo il saldo corrente"""
-        try:
-            balance_data = self.calculate_balance()
-            
-            saldo = balance_data['saldo']
-            saldo_icon = "🟢" if saldo >= 0 else "🔴"
-            saldo_text = "POSITIVO" if saldo >= 0 else "NEGATIVO"
-            
-            balance_text = f"💰 **SALDO ATTUALE**\n\n"
-            balance_text += f"💵 Totale puntato: €{balance_data['total_bet']:.2f}\n"
-            balance_text += f"🏆 Totale vinto: €{balance_data['total_winnings']:.2f}\n"
-            balance_text += f"{saldo_icon} **SALDO: €{saldo:.2f} ({saldo_text})**\n\n"
-            balance_text += f"📊 Giocate: {balance_data['total_bets']} ({balance_data['wins']}W-{balance_data['losses']}L)"
-            
-            await update.message.reply_text(balance_text, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Errore show_balance: {e}")
-            await update.message.reply_text("❌ Errore nel caricamento saldo. Riprova più tardi.")
+    async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Mostra la guida completa dei comandi"""
+        help_text = """
+🤖 **SUPERQUOTE BOT - GUIDA COMPLETA**
+
+🎯 **AGGIUNGERE UNA GIOCATA:**
+`SQ-risultato-quota-importo-esito`
+Esempio: `SQ-1MILAN-2.50-10.00-VINTA`
+
+🔧 **MODIFICARE UNA GIOCATA:**
+1. Solo esito: `MODIFICA-ID-ESITO`
+   Es: `MODIFICA-A1B2C3D4-VINTA`
+
+2. Tutti i campi: `MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO`
+   Es: `MODIFICA-A1B2C3D4-1MILAN-2.50-15.00-VINTA`
+
+3. Campo specifico: `MODIFICA-ID-CAMPO=VALORE`
+   Es: `MODIFICA-A1B2C3D4-QUOTA=2.50`
+   Es: `MODIFICA-A1B2C3D4-IMPORTO=20.00`
+   Es: `MODIFICA-A1B2C3D4-RISULTATO=OVER2.5`
+
+🗑️ **ELIMINARE UNA GIOCATA:**
+`ELIMINA-ID` oppure `DELETE-ID`
+Esempio: `ELIMINA-A1B2C3D4`
+
+📊 **COMANDI DISPONIBILI:**
+`/start` - Avvia il bot
+`/help` - Mostra questa guida
+`/stats` - Statistiche complete
+`/lista` - Lista ultime giocate
+`/lista 10` - Lista con limite
+`/grafico` - Grafico andamento
+`/export` - Esporta in CSV
+`/userstats` - Statistiche personali
+
+💡 **TIP:**
+• Usa `/lista` per vedere gli ID delle giocate
+• Gli esiti possono essere: VINTA, PERSA
+• Le quote usano il punto come separatore: 2.50
+• Gli importi sono in euro: 10.00
+
+🔍 **ESEMPI PRATICI:**
+Aggiungi: `SQ-OVER2.5-1.85-15.00-VINTA`
+Modifica: `MODIFICA-ABC12345-PERSA`
+Elimina: `ELIMINA-ABC12345`
+        """
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
     
     async def export_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Esporta i dati in formato CSV"""
+        """Esporta tutte le superquote in formato CSV"""
         try:
             superquotes = self.get_all_superquotes()
             
             if not superquotes:
-                await update.message.reply_text("📊 Nessun dato da esportare!")
+                await update.message.reply_text("📊 Nessuna superquote da esportare!")
                 return
             
+            # Crea il CSV in memoria
             output = io.StringIO()
-            writer = csv.writer(output)
+            fieldnames = ['ID', 'Data', 'Risultato', 'Quota', 'Importo', 'Vincita', 'Esito', 'Registrato da', 'Ultima modifica']
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
             
-            writer.writerow(['ID', 'Data', 'Risultato', 'Quota', 'Importo', 'Vincita', 'Esito', 'Registrato da'])
-            
+            writer.writeheader()
             for sq in superquotes:
-                writer.writerow([
-                    sq.get('quote_id', 'N/A'),
-                    sq['data'],
-                    sq['risultato'],
-                    sq['quota'],
-                    sq['importo'],
-                    sq['vincita'],
-                    sq['esito'],
-                    sq.get('registrato_da', 'N/A')
-                ])
+                writer.writerow({
+                    'ID': sq['quote_id'],
+                    'Data': sq['data'],
+                    'Risultato': sq['risultato'],
+                    'Quota': sq['quota'],
+                    'Importo': sq['importo'],
+                    'Vincita': sq['vincita'],
+                    'Esito': sq['esito'],
+                    'Registrato da': sq.get('registrato_da', 'N/A'),
+                    'Ultima modifica': sq.get('data_modifica', 'N/A')
+                })
             
-            csv_data = output.getvalue().encode('utf-8')
-            csv_filename = f'superquote_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            csv_data = output.getvalue()
+            output.close()
             
-            balance_data = self.calculate_balance()
-            saldo = balance_data['saldo']
-            saldo_text = "POSITIVO" if saldo >= 0 else "NEGATIVO"
+            # Crea file in memoria
+            csv_buffer = io.BytesIO()
+            csv_buffer.write(csv_data.encode('utf-8'))
+            csv_buffer.seek(0)
             
+            # Invia il file
             await update.message.reply_document(
-                document=io.BytesIO(csv_data),
-                filename=csv_filename,
-                caption=f"📊 Export completo delle superquote\n🎯 {len(superquotes)} record esportati\n💰 Saldo attuale: €{saldo:.2f} ({saldo_text})"
+                document=csv_buffer,
+                filename=f"superquote_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                caption=f"📊 Esportazione di {len(superquotes)} superquote"
             )
             
+            logger.info(f"📤 CSV esportato con {len(superquotes)} righe")
+            
         except Exception as e:
-            logger.error(f"Errore durante l'export: {e}")
-            await update.message.reply_text("❌ Errore durante l'export. Riprova più tardi.")
+            logger.error(f"Errore export_csv: {e}")
+            await update.message.reply_text("❌ Errore nell'esportazione. Riprova più tardi.")
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mostra i comandi disponibili"""
-        help_text = """
-🤖 **BOT SUPERQUOTE CONDIVISE**
-
-📝 **COME REGISTRARE:**
-Scrivi: `SQ-risultato-quota-importo-esito`
-
-🎯 **ESEMPI:**
-• `SQ-1MILAN-2.00-10.00-VINTA`
-• `SQ-OVER2.5-1.85-15.00-PERSA`
-• `SQ-COMBO-3.20-5.00-VINTA`
-• `SQ-GG-1.65-20.00-VINTA`
-
-✏️ **COME MODIFICARE:**
-Scrivi: `MODIFICA-ID-ESITO`
-
-🔧 **ESEMPI MODIFICA:**
-• `MODIFICA-A1B2C3D4-VINTA`
-• `MODIFICA-E5F6G7H8-PERSA`
-
-📊 **COMANDI:**
-/stats - Statistiche complete con saldo
-/lista - Ultime superquote con ID
-/vincite - Solo le vincite recenti  
-/saldo - Mostra solo il saldo attuale
-/graph - Grafico andamento vincite
-/export - Esporta tutto in CSV
-/help - Questo messaggio
-
-🎲 **ESITI VALIDI:**
-VINTA, VINCITA, WIN → registra come vincita
-PERSA, PERDITA, LOSS → registra come perdita
-
-⚠️ **IMPORTANTE:**
-- Il terzo numero è l'IMPORTO GIOCATO
-- La vincita si calcola automaticamente (quota × importo)
-- Ogni giocata ha un ID univoco per modifiche
-- Il saldo mostra se sei in positivo o negativo
-
-Il bot salva automaticamente tutto in MongoDB! 🗂️
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    def run(self):
-        """Avvia il bot"""
+    async def user_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Mostra le statistiche personali dell'utente"""
         try:
-            application = Application.builder().token(self.token).build()
+            user_id = update.message.from_user.id
+            username = update.message.from_user.username or update.message.from_user.first_name
             
-            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-            application.add_handler(CommandHandler("stats", self.show_stats))
-            application.add_handler(CommandHandler("lista", self.show_list))
-            application.add_handler(CommandHandler("vincite", self.show_recent_wins))
-            application.add_handler(CommandHandler("saldo", self.show_balance))
-            application.add_handler(CommandHandler("graph", self.generate_profit_graph))
-            application.add_handler(CommandHandler("export", self.export_csv))
-            application.add_handler(CommandHandler("help", self.help_command))
-            application.add_handler(CommandHandler("start", self.help_command))
+            stats = self.get_user_stats(user_id)
             
-            logger.info("🤖 Bot Superquote Enhanced avviato con successo!")
-            print("🤖 Bot Superquote Enhanced avviato! Premi Ctrl+C per fermare.")
-            print("📊 Comandi disponibili: /stats, /lista, /vincite, /saldo, /graph, /export, /help")
+            if stats['total_bets'] == 0:
+                await update.message.reply_text(
+                    f"👤 {username}, non hai ancora registrato nessuna superquote!"
+                )
+                return
             
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            stats_text = f"👤 **STATISTICHE PERSONALI - {username}**\n\n"
+            stats_text += f"🎯 Totale giocate: {stats['total_bets']}\n"
+            stats_text += f"✅ Vinte: {stats['wins']}\n"
+            stats_text += f"❌ Perse: {stats['losses']}\n"
+            
+            if stats['total_bets'] > 0:
+                percentuale_successo = (stats['wins'] / stats['total_bets']) * 100
+                stats_text += f"📈 % Successo: {percentuale_successo:.1f}%\n"
+            
+            stats_text += f"\n💰 **BILANCIO:**\n"
+            stats_text += f"💵 Totale puntato: €{stats['total_bet']:.2f}\n"
+            stats_text += f"🏆 Totale vinto: €{stats['total_winnings']:.2f}\n"
+            
+            saldo = stats['saldo']
+            saldo_icon = "🟢" if saldo >= 0 else "🔴"
+            saldo_text = "POSITIVO" if saldo >= 0 else "NEGATIVO"
+            
+            stats_text += f"{saldo_icon} **SALDO: €{saldo:.2f} ({saldo_text})**\n"
+            
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
             
         except Exception as e:
-            logger.error(f"Errore nell'avvio del bot: {e}")
-            raise
+            logger.error(f"Errore user_stats: {e}")
+            await update.message.reply_text("❌ Errore nel caricamento statistiche personali.")
+    
+    def parse_superquote(self, text: str) -> Optional[Dict]:
+        """Parsing del messaggio per estrarre i dati della superquote"""
+        try:
+            # Pattern per SQ-risultato-quota-importo-esito
+            pattern = r'^SQ-([^-]+)-([0-9.]+)-([0-9.]+)-([^-]+)$'
+            match = re.match(pattern, text.strip(), re.IGNORECASE)
+            
+            if match:
+                risultato = match.group(1).upper()
+                quota = float(match.group(2))
+                importo = float(match.group(3))
+                esito = match.group(4).upper()
+                
+                # Normalizza l'esito
+                if esito in ['VINTA', 'VINCITA', 'WIN', 'W']:
+                    esito = 'VINTA'
+                elif esito in ['PERSA', 'PERDITA', 'LOSS', 'L', 'PERSO']:
+                    esito = 'PERSA'
+                else:
+                    return None
+                
+                # Calcola la vincita
+                vincita = self.calculate_winning_amount(quota, importo, esito)
+                
+                return {
+                    'quote_id': self.generate_quote_id(),
+                    'risultato': risultato,
+                    'quota': quota,
+                    'importo': importo,
+                    'vincita': vincita,
+                    'esito': esito,
+                    'data': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Errore parsing superquote: {e}")
+            return None
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Gestisce il comando /start"""
+        welcome_text = """
+🤖 **BENVENUTO NEL SUPERQUOTE BOT!**
 
-# Configurazione e avvio
-if __name__ == "__main__":
-    import os
+🎯 Questo bot ti aiuta a tenere traccia delle tue superquote condivise con gli amici.
+
+📝 **COME INIZIARE:**
+1. Aggiungi una giocata: `SQ-risultato-quota-importo-esito`
+   Esempio: `SQ-1MILAN-2.50-10.00-VINTA`
+
+2. Visualizza le statistiche: `/stats`
+
+3. Vedi la lista: `/lista`
+
+🔧 **MODIFICHE FLESSIBILI:**
+Puoi modificare singoli campi o tutto:
+• Solo esito: `MODIFICA-ID-ESITO`
+• Campo specifico: `MODIFICA-ID-CAMPO=VALORE`
+• Tutto: `MODIFICA-ID-RISULTATO-QUOTA-IMPORTO-ESITO`
+
+📚 Per tutti i comandi: `/help`
+
+💡 **SUGGERIMENTO:** Inizia con `/lista` per vedere le giocate esistenti!
+        """
+        
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+def main():
+    """Funzione principale per avviare il bot"""
     
-    # Leggi le variabili d'ambiente
-    BOT_TOKEN = os.getenv('BOT_TOKEN')
-    MONGO_URI = os.getenv('MONGO_URL')
+    # Configurazione
+    TOKEN = os.getenv('TELEGRAM_TOKEN')
+    MONGODB_URI = os.getenv('MONGODB_URI')
     
-    if not BOT_TOKEN or not MONGO_URI:
-        print("❌ ERRORE: Imposta le variabili d'ambiente BOT_TOKEN e MONGO_URI")
-        print("💡 Su Railway: vai in Variables tab e aggiungi:")
-        print("   BOT_TOKEN=il_tuo_token_di_telegram")
-        print("   MONGO_URI=la_tua_stringa_di_connessione_mongodb")
-        exit(1)
+    if not TOKEN:
+        logger.error("❌ TELEGRAM_TOKEN non trovato nelle variabili d'ambiente!")
+        return
+    
+    if not MONGODB_URI:
+        logger.error("❌ MONGODB_URI non trovato nelle variabili d'ambiente!")
+        return
     
     try:
-        bot = SuperquoteBot(BOT_TOKEN, MONGO_URI)
-        bot.run()
+        # Inizializza il bot
+        bot = SuperquoteBot(TOKEN, MONGODB_URI)
+        application = Application.builder().token(TOKEN).build()
+        
+        # Aggiungi gestori comandi
+        application.add_handler(CommandHandler("start", bot.start))
+        application.add_handler(CommandHandler("help", bot.show_help))
+        application.add_handler(CommandHandler("stats", bot.show_stats))
+        application.add_handler(CommandHandler("lista", bot.show_list))
+        application.add_handler(CommandHandler("grafico", bot.generate_profit_graph))
+        application.add_handler(CommandHandler("export", bot.export_csv))
+        application.add_handler(CommandHandler("userstats", bot.user_stats))
+        
+        # Gestore messaggi generici (deve essere l'ultimo)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+        
+        logger.info("🤖 Bot avviato con successo!")
+        print("=" * 50)
+        print("SUPERQUOTE BOT AVVIATO!")
+        print("Comandi disponibili: /start, /help, /stats, /lista, /grafico")
+        print("=" * 50)
+        
+        # Avvia il bot
+        application.run_polling()
+        
     except ConnectionFailure as e:
-        print(f"❌ ERRORE CONNESSIONE MONGODB: {e}")
-        print("💡 Soluzioni:")
+        logger.error(f"❌ Errore di connessione MongoDB: {e}")
+        print(f"❌ ERRORE CRITICO: {e}")
+        print("💡 Soluzioni possibili:")
         print("1. Verifica che MongoDB sia attivo su Railway")
-        print("2. Controlla la stringa di connessione MONGO_URI")
+        print("2. Controlla la MONGODB_URI nelle variabili d'ambiente")
         print("3. Se hai esaurito lo spazio, usa MongoDB Atlas gratuito")
-        exit(1)
     except Exception as e:
-        print(f"❌ ERRORE IMPREVISTO: {e}")
-        exit(1)
+        logger.error(f"❌ Errore nell'avvio del bot: {e}")
+        print(f"❌ ERRORE CRITICO: {e}")
+
+if __name__ == '__main__':
+    main()
