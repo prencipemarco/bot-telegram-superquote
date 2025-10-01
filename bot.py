@@ -322,6 +322,36 @@ class SuperquoteBot:
             }
         return None
     
+    def delete_superquote(self, quote_id: str) -> bool:
+    """Elimina una superquote tramite il suo ID"""
+    try:
+        result = self.collection.delete_one({"quote_id": quote_id.upper()})
+        if result.deleted_count > 0:
+            logger.info(f"Superquote {quote_id} eliminata con successo")
+            return True
+        else:
+            logger.warning(f"Nessuna superquote trovata con ID {quote_id}")
+            return False
+    except Exception as e:
+        logger.error(f"Errore nell'eliminazione: {e}")
+        return False
+
+    def parse_delete_command(self, text: str) -> Optional[str]:
+        """
+        Parsing del comando di eliminazione
+        Formato: ELIMINA-ID o DELETE-ID
+        Esempio: ELIMINA-A1B2C3D4
+        """
+        text_clean = text.strip()
+        
+        pattern = r'^(?:ELIMINA|DELETE)-([A-Z0-9]{8})$'
+        match = re.match(pattern, text_clean, re.IGNORECASE)
+        
+        if match:
+            quote_id = match.group(1).upper()
+            return quote_id
+        return None
+    
     async def generate_profit_graph(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Genera e invia il grafico dell'andamento delle vincite"""
         try:
